@@ -1,53 +1,94 @@
-use tracing::{info};
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::interval;
+use tracing::{info, Level};
+use tracing_subscriber;
 
-mod core;
 mod peripherals;
-mod ui;
 
-use core::system::{VirtualMCU, SystemEvent};
+/// Events exchanged across the system.
+#[derive(Debug)]
+enum SystemEvent {
+    Tick(u64),
+    Interrupt(String),
+    Stop,
+}
 
-#[tokio::main]
-async fn main() {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_target(false) // hides the module name
-        .compact() // shortens log formatting
-        .init(); // activates the logging backend
+/// Simple virtual MCU that sends Tick events periodically.
+/// (We keep it small: it will also send a Stop after some ticks.)
+struct VirtualMCU {
+    tick_count: u64,
+}
 
-    info!("Starting Virtual Peripheral Simulator...");
-    
-    // Create channel between "MCU core" and "main controller"
-    let (tx, mut rx) = mpsc::channel::<SystemEvent>(32);
-    
-    // Create MCU
-    let mcu = VirtualMCU::new(200); // 200ms tick
-    
-    // Spawn MCU task
-    tokio::spawn(async move {
-        mcu.run(tx).await;
-    });
+impl VirtualMCU {
+    fn new() -> Self {
+        VirtualMCU { tick_count: 0 }
+    }
 
-    // Receive and handle events
-    while let Some(event) = rx.recv().await {
-        match event {
-            SystemEvent::Tick(count) => info!("Tick {}", count),
-            SystemEvent::Interrupt(src) => info!("Interrupt from {}", src),
-            SystemEvent::Stop => {
-                info!("System stopping gracefully.");
+    async fn run(&mut self, tx: mpsc::Sender<SystemEvent>, tick_ms: u64, max_ticks: u64) {
+        let mut ticker = interval(Duration::from_millis(tick_ms));
+        loop {
+            ticker.tick().await;
+            self.tick_count += 1;
+
+            // Post a Tick event
+            if tx.send(SystemEvent::Tick(self.tick_count)).await.is_err() {
+                // receiver dropped
+                break;
+            }
+
+            // stop condition
+            if self.tick_count >= max_ticks {
+                let _ = tx.send(SystemEvent::Stop).await;
                 break;
             }
         }
     }
-
-    info!("Simulation ended.");
 }
 
-    
-   
-  
- 
-    
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .init();
 
+    // Channel between producers (MCU + peripherals) and the main consumer
+    let (tx, mut rx) = mpsc::channel::<SystemEvent>(64);
 
+    // Clone tx for each producer we spawn
+    let tx_for_mcu  = tx.clone();
+    let tx_for_uart = tx.clone();
+    let tx_for_gpio = tx.clone();
 
+    // Spawn the virtual MCU core
+    tokio::spawn(async move {
+        let mut mcu = VirtualMCU::new();
+        // tick every 200 ms, stop after 60 ticks
+        mcu.run(tx_for_mcu, 200, 60).await;
+    });
+
+    // Spawn UART simulator (periodic bytes every 500 ms)
+    peripherals::spawn_uart(tx_for_uart, 500);
+
+    // Spawn GPIO simulator (avg event every 700 ms)
+    peripherals::spawn_gpio(tx_for_gpio, 700);
+
+    // Main event loop (consumer)
+    while let Some(event) = rx.recv().await {
+        match event {
+            SystemEvent::Tick(count) => {
+                info!("Tick: {}", count);
+            }
+            SystemEvent::Interrupt(payload) => {
+                // We receive both GPIO and UART interrupts here.
+                // In a real firmware you'd route by source, or decode payload.
+                info!("Peripheral interrupt: {}", payload);
+            }
+            SystemEvent::Stop => {
+                info!("Simulation stop requested.");
+                break;
+            }
+        }
+    }
+    info!("Simulation finished.");
+}
