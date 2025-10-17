@@ -5,9 +5,10 @@ use tracing::{info, Level};
 use tracing_subscriber;
 
 mod peripherals;
+mod monitor;
 
 /// Events exchanged across the system.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SystemEvent {
     Tick(u64),
     Interrupt(String),
@@ -54,11 +55,16 @@ async fn main() {
 
     // Channel between producers (MCU + peripherals) and the main consumer
     let (tx, mut rx) = mpsc::channel::<SystemEvent>(64);
+    let (bcast_tx, _) = tokio::sync::broadcast::channel::<SystemEvent>(64);
 
     // Clone tx for each producer we spawn
     let tx_for_mcu  = tx.clone();
     let tx_for_uart = tx.clone();
     let tx_for_gpio = tx.clone();
+
+    // Start system monitor
+    let monitor_rx = bcast_tx.subscribe();
+    monitor::spawn_monitor(monitor_rx);
 
     // Spawn the virtual MCU core
     tokio::spawn(async move {
@@ -75,6 +81,9 @@ async fn main() {
 
     // Main event loop (consumer)
     while let Some(event) = rx.recv().await {
+        // Send a copy of the event to broadcast monitor
+        let _ = bcast_tx.send(event.clone());
+
         match event {
             SystemEvent::Tick(count) => {
                 info!("Tick: {}", count);
